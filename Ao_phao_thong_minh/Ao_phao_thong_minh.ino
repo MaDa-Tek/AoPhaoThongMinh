@@ -1,8 +1,12 @@
 /*
   ESP32: GPS + SIM + MAX30100 + SHT30 + ThingSpeak + SENSOR WATER
-  - BUTTON_1: BẬT gửi SMS (toggle ON)
-  - BUTTON_2: TẮT gửi SMS (toggle OFF)
-  - Gửi SMS 1 phút/lần khi nước > 2000 và smsEnabled = true
+
+  - BUTTON_ON  (GPIO25): BẬT gửi SMS
+  - BUTTON_OFF (GPIO26): TẮT gửi SMS
+  - Gửi SMS 1 phút/lần khi:
+        + Nước > WATER_THRESHOLD
+        + smsEnabled = true
+        + GPS đã fix (có tọa độ)
 */
 
 #include <Wire.h>
@@ -12,21 +16,23 @@
 #include <ThingSpeak.h>
 #include <math.h>
 
-// ------------------ PIN ------------------
+// ================== PIN ==================
 #define SENSOR_WATER 33
-#define BUTTON_1     25
-#define BUTTON_2     32
+#define BUTTON_ON    25   // BẬT SMS
+#define BUTTON_OFF   26   // TẮT SMS
 const int WATER_THRESHOLD = 2000;
 
-// SMS state
+// Trạng thái gửi SMS
 bool smsEnabled = false;
 
-// chống dội nút
-bool lastBtn1 = HIGH, lastBtn2 = HIGH;
-unsigned long lastDebounce1 = 0, lastDebounce2 = 0;
-const unsigned long debounceDelay = 40; 
+// Chống dội nút
+bool lastBtnOn  = HIGH;
+bool lastBtnOff = HIGH;
+unsigned long lastDebOn  = 0;
+unsigned long lastDebOff = 0;
+const unsigned long debounceDelay = 40;
 
-// ------------------ MAX30100 + SHT30 ------------------
+// ================== MAX30100 + SHT30 ==================
 #define MAX30100_ADDR 0x57
 #define SHT30_ADDR    0x44
 
@@ -68,14 +74,14 @@ bool initMAX30100(){
   i2cWrite8(MAX30100_ADDR, MAX30100_FIFO_WR_PTR, 0x00);
   i2cWrite8(MAX30100_ADDR, MAX30100_OVF_COUNTER, 0x00);
   i2cWrite8(MAX30100_ADDR, MAX30100_FIFO_RD_PTR, 0x00);
-  i2cWrite8(MAX30100_ADDR, MAX30100_MODE_CONFIG, 0x03);
+  i2cWrite8(MAX30100_ADDR, MAX30100_MODE_CONFIG, 0x03); // HR only
   i2cWrite8(MAX30100_ADDR, MAX30100_SPO2_CONFIG, 0x4F);
   i2cWrite8(MAX30100_ADDR, MAX30100_LED_CONFIG, 0xFF);
   delay(10);
   return ((i2cRead8(MAX30100_ADDR, MAX30100_MODE_CONFIG) & 0x07) == 0x03);
 }
 
-// read MAX30100
+// Đọc MAX30100 raw
 bool readMAX30100Raw(uint16_t &ir, uint16_t &red){
   uint8_t buf[4];
   i2cReadBytes(MAX30100_ADDR, MAX30100_FIFO_DATA, buf, 4);
@@ -84,7 +90,7 @@ bool readMAX30100Raw(uint16_t &ir, uint16_t &red){
   return true;
 }
 
-// ------------------ SHT30 ------------------
+// SHT30
 bool readSHT30(float &t, float &h){
   Wire.beginTransmission(SHT30_ADDR);
   Wire.write(0x24);
@@ -109,7 +115,7 @@ bool readSHT30(float &t, float &h){
 bool haveMAX=false, haveSHT=false;
 float g_temperature=NAN, g_humidity=NAN;
 
-// ------------------ HR algorithm (giữ nguyên như bạn) ------------------
+// HR & SpO2 (giữ nguyên thuật toán cũ của bạn, rút gọn comment)
 const int SAMPLE_INTERVAL_MS=10;
 uint32_t lastSampleTime=0;
 const int BUFFER_SIZE=200;
@@ -208,7 +214,7 @@ void sampleMaxAndUpdateHR(){
         float newHR = 60000.0 / avgRR;
 
         if (validHR && fabs(newHR-heartRate) > MAX_HR_JUMP){
-          // ignore spike
+          // spike -> bỏ qua
         } else {
           if (!validHR) heartRate=newHR;
           else heartRate = 0.9*heartRate + 0.1*newHR;
@@ -254,7 +260,7 @@ void computeSpO2(){
   validSpO2=true;
 }
 
-// ------------------ SIM + GPS ------------------
+// ================== SIM + GPS ==================
 TinyGPSPlus gps;
 HardwareSerial GPS_Serial(2);
 
@@ -267,9 +273,9 @@ HardwareSerial GPS_Serial(2);
 
 HardwareSerial SIM_Serial(1);
 
-// WiFi
+// WiFi + ThingSpeak
 const char* ssid="MADATEK";
-const char* password="hoicaiconcac";
+const char* password="Madatek68686868";
 unsigned long myChannelNumber=3165784;
 const char* myWriteAPIKey="YNNOSS5T98TAYGEO";
 WiFiClient client;
@@ -281,7 +287,7 @@ unsigned long lastSensorPrint=0;
 unsigned long lastSmsTime=0;
 const unsigned long SMS_INTERVAL_MS=60000;
 
-// ------------------ SIM helpers ------------------
+// SIM helpers
 void flushSIM(){
   while (SIM_Serial.available()) SIM_Serial.read();
 }
@@ -330,8 +336,11 @@ void sendLocationSMS(float lat, float lon){
   Serial.println("SMS sent.");
 }
 
-void updateGPS(){
-  while (GPS_Serial.available()) gps.encode(GPS_Serial.read());
+// GPS helpers
+void updateGPSStream(){
+  while (GPS_Serial.available()) {
+    gps.encode(GPS_Serial.read());
+  }
 }
 
 void printGPS(){
@@ -364,13 +373,13 @@ void sendToThingSpeak(){
   Serial.print("TS code: "); Serial.println(http);
 }
 
-// ------------------ SETUP ------------------
+// ================== SETUP ==================
 void setup(){
   Serial.begin(115200);
   delay(2000);
 
-  pinMode(BUTTON_1, INPUT_PULLUP);
-  pinMode(BUTTON_2, INPUT_PULLUP);
+  pinMode(BUTTON_ON,  INPUT_PULLUP);
+  pinMode(BUTTON_OFF, INPUT_PULLUP);
 
   Wire.begin(21,22);
   Wire.setClock(100000);
@@ -378,7 +387,6 @@ void setup(){
   float T0,H0;
   haveSHT = readSHT30(T0,H0);
   haveMAX = initMAX30100();
-
   g_temperature=T0;
   g_humidity=H0;
 
@@ -401,97 +409,132 @@ void setup(){
     Serial.print(".");
   }
   Serial.println("\nWiFi OK");
-
   ThingSpeak.begin(client);
 }
 
-// ------------------ LOOP ------------------
-void loop(){
-  // ----- Đọc nút với debounce -----
-  bool reading1 = digitalRead(BUTTON_1);
-  bool reading2 = digitalRead(BUTTON_2);
+// ================== LOOP ==================
+void loop() {
+  // luôn feed GPS để nhanh fix
+  updateGPSStream();
 
-  // BUTTON_1 → bật smsEnabled
-  if (reading1 != lastBtn1){
-    lastDebounce1 = millis();
-  }
-  if ((millis() - lastDebounce1) > debounceDelay){
-    if (reading1 == LOW && lastBtn1 == HIGH){
-      smsEnabled = true;
-      lastSmsTime = 0;
-      Serial.println(">>> BUTTON_1: BẬT gửi SMS");
-    }
-  }
-  lastBtn1 = reading1;
+  // ====== ĐỌC NÚT ======
+  int readingOn  = digitalRead(BUTTON_ON);
+  int readingOff = digitalRead(BUTTON_OFF);
 
-  // BUTTON_2 → tắt smsEnabled
-  if (reading2 != lastBtn2){
-    lastDebounce2 = millis();
+  // DEBUG: in ra khi có thay đổi raw
+  static int prevOn  = HIGH;
+  static int prevOff = HIGH;
+  if (readingOn != prevOn) {
+    Serial.print("[RAW]  BUTTON_ON  = ");
+    Serial.println(readingOn);    // 1 = nhả, 0 = nhấn (INPUT_PULLUP)
+    prevOn = readingOn;
   }
-  if ((millis() - lastDebounce2) > debounceDelay){
-    if (reading2 == LOW && lastBtn2 == HIGH){
-      smsEnabled = false;
-      Serial.println(">>> BUTTON_2: TẮT gửi SMS");
-    }
+  if (readingOff != prevOff) {
+    Serial.print("[RAW]  BUTTON_OFF = ");
+    Serial.println(readingOff);
+    prevOff = readingOff;
   }
-  lastBtn2 = reading2;
 
-  // ----- Đọc cảm biến nước -----
+// ====== BUTTON ON: NHẤN 1 CÁI -> BẬT smsEnabled, GIỮ STATE ======
+  if (readingOn == LOW && lastBtnOn == HIGH) {   // cạnh HIGH -> LOW = nhấn
+    smsEnabled = true;        // lưu state = ON
+    lastSmsTime = 0;          // reset bộ đếm gửi SMS
+    Serial.println("[BTN] ON pressed  -> smsEnabled = TRUE");
+  }
+  lastBtnOn = readingOn;
+
+// ====== BUTTON OFF: NHẤN 1 CÁI -> TẮT smsEnabled, GIỮ STATE ======
+  if (readingOff == LOW && lastBtnOff == HIGH) { // cạnh HIGH -> LOW = nhấn
+    smsEnabled = false;       // lưu state = OFF
+    Serial.println("[BTN] OFF pressed -> smsEnabled = FALSE");
+  }
+  lastBtnOff = readingOff;
+
+// ====== BUTTON OFF ======
+if (readingOff != lastBtnOff) {
+  lastDebOff = millis();
+}
+if ((millis() - lastDebOff) > debounceDelay) {
+  if (readingOff == LOW && lastBtnOff == HIGH) {
+    smsEnabled = false;
+    Serial.println("[BTN] OFF pressed ➜ smsEnabled = FALSE");
+  }
+}
+lastBtnOff = readingOff;
+
+  // ====== CẢM BIẾN NƯỚC ======
   int water = analogRead(SENSOR_WATER);
   bool alarmOn = (water > WATER_THRESHOLD);
 
-  // ======= Nếu NƯỚC > NGƯỠNG =======
-  if (alarmOn){
-    updateGPS();
+  // ====== NƯỚC VƯỢT NGƯỠNG ======
+  if (alarmOn) {
     if (haveMAX) sampleMaxAndUpdateHR();
 
-    if (millis()-lastGpsPrint >= 2000){
+    if (millis() - lastGpsPrint >= 2000) {
       printGPS();
       lastGpsPrint = millis();
     }
 
-    if (millis()-lastTsSend >= 20000){
+    if (millis() - lastTsSend >= 20000) {
       lastTsSend = millis();
       if (haveMAX) computeSpO2();
       sendToThingSpeak();
     }
 
-    // log mỗi 1s
-    if (millis()-lastSensorPrint >= 1000){
+    if (millis() - lastSensorPrint >= 1000) {
       lastSensorPrint = millis();
-      float t,h;
-      if (readSHT30(t,h)){ g_temperature=t; g_humidity=h; }
 
+      float t, h;
+      if (readSHT30(t, h)) {
+        g_temperature = t;
+        g_humidity    = h;
+      }
       if (haveMAX) computeSpO2();
 
-      Serial.print("Water=");
+      Serial.print("[ALARM] WATER=");
       Serial.print(water);
+
+      Serial.print(" | T=");
+      if (!isnan(g_temperature)) Serial.print(g_temperature, 1); else Serial.print("--");
+      Serial.print(" °C | H=");
+      if (!isnan(g_humidity)) Serial.print(g_humidity, 1); else Serial.print("--");
+      Serial.print(" %");
+
+      Serial.print(" | HR=");
+      if (haveMAX && validHR) Serial.print(heartRate, 0); else Serial.print("--");
+      Serial.print(" bpm | SpO2=");
+      if (haveMAX && validSpO2) Serial.print(spo2, 0); else Serial.print("--");
+      Serial.print(" %");
+
       Serial.print(" | SMS=");
       Serial.println(smsEnabled ? "ON" : "OFF");
     }
 
-    // ----- GỬI SMS nếu đã bật -----
-    if (smsEnabled && (millis()-lastSmsTime >= SMS_INTERVAL_MS)){
-      if (gps.location.isValid()){
+    // ====== GỬI SMS ======
+    if (smsEnabled && (millis() - lastSmsTime >= SMS_INTERVAL_MS)) {
+      Serial.println("[SMS] Check GPS...");
+      if (gps.location.isValid()) {
         float lat = gps.location.lat();
         float lon = gps.location.lng();
-        Serial.println("Gui SMS...");
-        sendLocationSMS(lat,lon);
+        Serial.println("[SMS] GPS FIX OK -> Gui SMS...");
+        sendLocationSMS(lat, lon);
       } else {
-        Serial.println("Skip SMS: no GPS fix.");
+        Serial.println("[SMS] GPS CHUA FIX -> KHONG gui SMS.");
       }
       lastSmsTime = millis();
     }
-
   }
-  // ======= NƯỚC BÌNH THƯỜNG =======
+
+  // ====== NƯỚC BÌNH THƯỜNG ======
   else {
-    if (millis()-lastSensorPrint >= 1000){
+    if (millis() - lastSensorPrint >= 1000) {
       lastSensorPrint = millis();
       Serial.print("Water normal: ");
-      Serial.println(water);
+      Serial.print(water);
+      Serial.print(" | SMS=");
+      Serial.println(smsEnabled ? "ON" : "OFF");
     }
-    validHR=false;
-    validSpO2=false;
+    validHR = false;
+    validSpO2 = false;
   }
 }
