@@ -26,7 +26,7 @@
 #define SENSOR_WATER 33
 #define BUTTON_ON    25   // BẬT SMS
 #define BUTTON_OFF   26   // TẮT SMS
-const int WATER_THRESHOLD = 2000;
+const int WATER_THRESHOLD = 1500;
 
 // Trạng thái gửi SMS
 bool smsEnabled = false;
