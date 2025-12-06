@@ -1,5 +1,5 @@
 /*
-  ESP32: GPS + SIM + MAX30100 + SHT30 + ThingSpeak + SENSOR WATER
+  ESP32: GPS + SIM + MAX30100 + SHT30 + SENSOR WATER + ThingSpeak qua 4G (không dùng WiFi)
 
   - BUTTON_ON  (GPIO25): BẬT gửi SMS
   - BUTTON_OFF (GPIO26): TẮT gửi SMS
@@ -7,13 +7,19 @@
         + Nước > WATER_THRESHOLD
         + smsEnabled = true
         + GPS đã fix (có tọa độ)
+
+  - Gửi dữ liệu ThingSpeak qua 4G:
+        + Dùng module SIM mở PDP + TCP, gửi HTTP GET
+
+  Sử dụng FreeRTOS:
+    - loop() trên core 1: đọc cảm biến, cập nhật dữ liệu
+    - taskSIM trên core 0: gửi SMS + ThingSpeak qua SIM
 */
 
+#include <Arduino.h>
 #include <Wire.h>
 #include <HardwareSerial.h>
-#include <WiFi.h>
 #include <TinyGPSPlus.h>
-#include <ThingSpeak.h>
 #include <math.h>
 
 // ================== PIN ==================
@@ -115,7 +121,7 @@ bool readSHT30(float &t, float &h){
 bool haveMAX=false, haveSHT=false;
 float g_temperature=NAN, g_humidity=NAN;
 
-// HR & SpO2 (giữ nguyên thuật toán cũ của bạn, rút gọn comment)
+// HR & SpO2
 const int SAMPLE_INTERVAL_MS=10;
 uint32_t lastSampleTime=0;
 const int BUFFER_SIZE=200;
@@ -214,7 +220,7 @@ void sampleMaxAndUpdateHR(){
         float newHR = 60000.0 / avgRR;
 
         if (validHR && fabs(newHR-heartRate) > MAX_HR_JUMP){
-          // spike -> bỏ qua
+          // spike -> bỏ
         } else {
           if (!validHR) heartRate=newHR;
           else heartRate = 0.9*heartRate + 0.1*newHR;
@@ -273,12 +279,8 @@ HardwareSerial GPS_Serial(2);
 
 HardwareSerial SIM_Serial(1);
 
-// WiFi + ThingSpeak
-const char* ssid="MADATEK";
-const char* password="Madatek68686868";
-unsigned long myChannelNumber=3165784;
-const char* myWriteAPIKey="YNNOSS5T98TAYGEO";
-WiFiClient client;
+// ThingSpeak (sẽ gửi bằng HTTP GET qua SIM)
+const char* TS_API_KEY = "YNNOSS5T98TAYGEO";
 
 // timers
 unsigned long lastGpsPrint=0;
@@ -286,25 +288,42 @@ unsigned long lastTsSend=0;
 unsigned long lastSensorPrint=0;
 unsigned long lastSmsTime=0;
 const unsigned long SMS_INTERVAL_MS=60000;
+const unsigned long TS_INTERVAL_MS = 20000;  // 20s
 
-// SIM helpers
+// ====== SHARE DATA GIỮA LOOP VÀ TASK SIM ======
+volatile bool  tsReqPending  = false;  // yêu cầu gửi ThingSpeak
+volatile bool  smsReqPending = false;  // yêu cầu gửi SMS
+
+volatile float latestLat = 0;
+volatile float latestLon = 0;
+volatile bool  latestFix = false;
+
+volatile float tsLat = 0, tsLon = 0;   // snapshot để gửi TS
+volatile float smsLat = 0, smsLon = 0; // snapshot để gửi SMS
+
+// ========== SIM helpers ==========
 void flushSIM(){
   while (SIM_Serial.available()) SIM_Serial.read();
 }
 
 bool sim_wait_for(const char *target, unsigned long timeout){
-  String resp="";
-  unsigned long start=millis();
-  while (millis()-start < timeout){
-    while (SIM_Serial.available()){
-      char c=SIM_Serial.read();
+  String resp = "";
+  unsigned long start = millis();
+
+  while (millis() - start < timeout) {
+    while (SIM_Serial.available()) {
+      char c = SIM_Serial.read();
       Serial.print(c);
       resp += c;
-      if (resp.indexOf(target)>=0) return true;
+      if (resp.indexOf(target) >= 0) return true;
     }
+
+    // RẤT QUAN TRỌNG: nhường CPU cho task khác + idle
+    vTaskDelay(1);       // hoặc delay(1);
   }
   return false;
 }
+
 
 bool sim_cmd_ok(const char *cmd, unsigned long timeout=3000){
   flushSIM();
@@ -314,6 +333,111 @@ bool sim_cmd_ok(const char *cmd, unsigned long timeout=3000){
   return sim_wait_for("OK", timeout);
 }
 
+// Khởi tạo 4G / PDP
+bool simSetup4G() {
+  // Test AT cơ bản
+  if (!sim_cmd_ok("AT", 2000)) return false;
+  sim_cmd_ok("ATE0", 2000);          // tắt echo
+
+  // SIM & đăng ký mạng
+  if (!sim_cmd_ok("AT+CPIN?", 5000)) return false;  // SIM READY
+  sim_cmd_ok("AT+CSQ",   2000);      // cường độ sóng
+  sim_cmd_ok("AT+CREG?", 5000);      // đăng ký mạng
+  sim_cmd_ok("AT+CGREG?",5000);      // đăng ký mạng data
+
+  // Cấu hình APN (Viettel)
+  sim_cmd_ok("AT+CGDCONT=1,\"IP\",\"v-internet\"", 5000);
+
+  // ----- MỞ DỊCH VỤ SOCKET (NETOPEN) -----
+  Serial.println("OK[SIM] NETOPEN...");
+  flushSIM();
+  Serial.println(">> AT+NETOPEN");
+  SIM_Serial.println("AT+NETOPEN");
+
+    String resp = "";
+  unsigned long start = millis();
+  while (millis() - start < 15000) {
+    while (SIM_Serial.available()) {
+      char c = SIM_Serial.read();
+      Serial.print(c);
+      resp += c;
+    }
+    // cho watchdog hài lòng
+    vTaskDelay(1);   // hoặc delay(1);
+  }
+
+
+  // 2 trường hợp coi là THÀNH CÔNG:
+  //  - Có "OK"
+  //  - Hoặc có "Network is already opened"
+  if (resp.indexOf("OK") == -1 &&
+      resp.indexOf("Network is already opened") == -1) {
+    Serial.println("[SIM] NETOPEN FAIL");
+    return false;
+  }
+
+  Serial.println("[SIM] NETOPEN OK (da mo hoac da mo san)");
+
+  // In thử IP để debug (không bắt buộc)
+  sim_cmd_ok("AT+IPADDR", 5000);
+
+  Serial.println("[SIM] 4G socket service READY");
+  return true;
+}
+
+// HTTP GET tới host:port bằng SIM
+bool simHttpGet(const char* host, uint16_t port, const String& req) {
+  flushSIM();
+
+  // 1. MỞ TCP CLIENT SOCKET #1
+  {
+    String cmd = String("AT+CIPOPEN=1,\"TCP\",\"") + host + "\"," + String(port);
+    Serial.print(">> ");
+    Serial.println(cmd);
+    SIM_Serial.println(cmd);
+
+    if (!sim_wait_for("+CIPOPEN: 1,0", 20000)) {
+      Serial.println("[SIM] CIPOPEN FAIL (khong thay +CIPOPEN: 1,0)");
+      return false;
+    }
+    Serial.println("[SIM] CIPOPEN OK");
+  }
+
+  // 2. BÁO GỬI DỮ LIỆU VỚI ĐỘ DÀI CỐ ĐỊNH
+  {
+    String cmd = String("AT+CIPSEND=1,") + req.length();
+    flushSIM();
+    Serial.print(">> ");
+    Serial.println(cmd);
+    SIM_Serial.println(cmd);
+
+    if (!sim_wait_for(">", 10000)) {
+      Serial.println("[SIM] no '>' prompt after CIPSEND");
+      return false;
+    }
+  }
+
+  // 3. GỬI HTTP GET
+  Serial.println("[SIM] Sending HTTP GET...");
+  SIM_Serial.print(req);
+
+  if (!sim_wait_for("+CIPSEND: 1,", 15000) && !sim_wait_for("OK", 5000)) {
+    Serial.println("[SIM] CIPSEND maybe FAIL (khong thay +CIPSEND: 1, / OK)");
+  }
+
+  // 4. ĐỌC PHẢN HỒI
+  sim_wait_for("+IPD", 5000);
+  sim_wait_for("CIPCLOSE", 10000);
+
+  // 5. ĐÓNG SOCKET #1
+  SIM_Serial.println("AT+CIPCLOSE=1");
+  sim_wait_for("OK", 5000);
+
+  Serial.println("[SIM] HTTP done, socket closed");
+  return true;
+}
+
+// Gửi SMS vị trí
 void sendLocationSMS(float lat, float lon){
   flushSIM();
   SIM_Serial.println("AT+CMGF=1");
@@ -343,34 +467,80 @@ void updateGPSStream(){
   }
 }
 
-void printGPS(){
-  if (gps.location.isValid()){
-    Serial.print("Lat: "); Serial.print(gps.location.lat(),6);
-    Serial.print("  Lng: "); Serial.println(gps.location.lng(),6);
-  } else Serial.println("Chua co fix GPS.");
+// Gửi dữ liệu lên ThingSpeak qua 4G (dùng toạ độ đã snapshot)
+void sendToThingSpeak(float lat, float lon) {
+  float temp = isnan(g_temperature) ? 0 : g_temperature;
+  float hum  = isnan(g_humidity)    ? 0 : g_humidity;
+
+  int hrInt = (haveMAX && validHR)   ? (int)round(heartRate) : 0;
+  int oxInt = (haveMAX && validSpO2) ? (int)round(spo2)      : 0;
+
+  String url = "/update?api_key=";
+  url += TS_API_KEY;
+
+  url += "&field1=";
+  url += String(lat, 6);
+
+  url += "&field2=";
+  url += String(lon, 6);
+
+  url += "&field3=";
+  url += String(temp, 1);
+
+  url += "&field4=";
+  url += String(hum, 1);
+
+  url += "&field5=";
+  url += hrInt;
+
+  url += "&field6=";
+  url += oxInt;
+
+  String req = "GET ";
+  req += url;
+  req += " HTTP/1.1\r\n"
+         "Host: api.thingspeak.com\r\n"
+         "Connection: close\r\n\r\n";
+
+  Serial.println("[TS] HTTP GET via SIM:");
+  Serial.println(req);
+
+  if (simHttpGet("api.thingspeak.com", 80, req)) {
+    Serial.println("[TS] OK via SIM");
+  } else {
+    Serial.println("[TS] FAIL via SIM");
+  }
 }
 
-void sendToThingSpeak(){
-  if (!gps.location.isValid()){
-    Serial.println("TS skip (no GPS fix).");
-    return;
+// ========== TASK SIM (FreeRTOS) ==========
+void taskSIM(void *pvParameters) {
+  (void) pvParameters;
+
+  for (;;) {
+    // Ưu tiên SMS
+    if (smsReqPending) {
+      float lat = smsLat;
+      float lon = smsLon;
+      smsReqPending = false;
+
+      Serial.println("[SIM-TASK] Sending SMS...");
+      sendLocationSMS(lat, lon);
+      Serial.println("[SIM-TASK] SMS done.");
+    }
+
+    // Sau đó tới ThingSpeak
+    if (tsReqPending) {
+      float lat = tsLat;
+      float lon = tsLon;
+      tsReqPending = false;
+
+      Serial.println("[SIM-TASK] Sending TS via SIM...");
+      sendToThingSpeak(lat, lon);
+      Serial.println("[SIM-TASK] TS done.");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));  // nghỉ 100 ms
   }
-
-  float lat = gps.location.lat();
-  float lon = gps.location.lng();
-
-  ThingSpeak.setField(1, lat);
-  ThingSpeak.setField(2, lon);
-  ThingSpeak.setField(3, isnan(g_temperature)?0:g_temperature);
-  ThingSpeak.setField(4, isnan(g_humidity)?0:g_humidity);
-  ThingSpeak.setField(5, (haveMAX && validHR)?heartRate:0);
-  ThingSpeak.setField(6, (haveMAX && validSpO2)?spo2:0);
-
-  String mapStr="https://maps.google.com/?q="+String(lat,6)+","+String(lon,6);
-  ThingSpeak.setField(7, mapStr);
-
-  int http = ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
-  Serial.print("TS code: "); Serial.println(http);
 }
 
 // ================== SETUP ==================
@@ -391,31 +561,60 @@ void setup(){
   g_humidity=H0;
 
   pinMode(MCU_SIM_EN_PIN, OUTPUT);
-  digitalWrite(MCU_SIM_EN_PIN, LOW);
+  digitalWrite(MCU_SIM_EN_PIN, LOW); // hoặc HIGH tùy mạch SIM của bạn
 
-  GPS_Serial.begin(9600, SERIAL_8N1, 16,17);
+  GPS_Serial.begin(9600, SERIAL_8N1, 16,17); // GPS RX/TX
   SIM_Serial.begin(MCU_SIM_BAUDRATE, SERIAL_8N1, MCU_SIM_RX_PIN, MCU_SIM_TX_PIN);
 
-  delay(8000);
+  delay(8000); // chờ module SIM lên
+
+  Serial.println("== INIT SIM ==");
   sim_cmd_ok("AT");
   sim_cmd_ok("ATI");
-  sim_cmd_ok("AT+CPIN?");
-  sim_cmd_ok("AT+CSQ");
   sim_cmd_ok("AT+CIMI");
 
-  WiFi.begin(ssid,password);
-  while (WiFi.status()!=WL_CONNECTED){
-    delay(500);
-    Serial.print(".");
+  if (simSetup4G()) {
+    Serial.println("== 4G READY ==");
+  } else {
+    Serial.println("== 4G FAIL ==");
   }
-  Serial.println("\nWiFi OK");
-  ThingSpeak.begin(client);
+
+  // Tạo task SIM trên core 0
+  xTaskCreatePinnedToCore(
+    taskSIM,
+    "SIM_TASK",
+    8192,
+    NULL,
+    1,
+    NULL,
+    0   // core 0
+  );
 }
 
-// ================== LOOP ==================
+// ================== LOOP (TASK CẢM BIẾN) ==================
 void loop() {
   // luôn feed GPS để nhanh fix
   updateGPSStream();
+
+  // ====== CẬP NHẬT GPS + LƯU TOẠ ĐỘ ======
+  if (millis() - lastGpsPrint >= 2000) {
+    lastGpsPrint = millis();
+
+    if (gps.location.isValid()) {
+      double lat = gps.location.lat();
+      double lon = gps.location.lng();
+
+      latestLat = lat;
+      latestLon = lon;
+      latestFix = true;
+
+      Serial.print("Lat: "); Serial.print(lat, 6);
+      Serial.print("  Lng: "); Serial.println(lon, 6);
+    } else {
+      latestFix = false;
+      Serial.println("Chua co fix GPS.");
+    }
+  }
 
   // ====== ĐỌC NÚT ======
   int readingOn  = digitalRead(BUTTON_ON);
@@ -426,7 +625,7 @@ void loop() {
   static int prevOff = HIGH;
   if (readingOn != prevOn) {
     Serial.print("[RAW]  BUTTON_ON  = ");
-    Serial.println(readingOn);    // 1 = nhả, 0 = nhấn (INPUT_PULLUP)
+    Serial.println(readingOn);
     prevOn = readingOn;
   }
   if (readingOff != prevOff) {
@@ -435,32 +634,20 @@ void loop() {
     prevOff = readingOff;
   }
 
-// ====== BUTTON ON: NHẤN 1 CÁI -> BẬT smsEnabled, GIỮ STATE ======
-  if (readingOn == LOW && lastBtnOn == HIGH) {   // cạnh HIGH -> LOW = nhấn
-    smsEnabled = true;        // lưu state = ON
-    lastSmsTime = 0;          // reset bộ đếm gửi SMS
+  // ====== BUTTON ON: NHẤN 1 CÁI -> BẬT smsEnabled ======
+  if (readingOn == LOW && lastBtnOn == HIGH) {
+    smsEnabled = true;
+    lastSmsTime = 0;
     Serial.println("[BTN] ON pressed  -> smsEnabled = TRUE");
   }
   lastBtnOn = readingOn;
 
-// ====== BUTTON OFF: NHẤN 1 CÁI -> TẮT smsEnabled, GIỮ STATE ======
-  if (readingOff == LOW && lastBtnOff == HIGH) { // cạnh HIGH -> LOW = nhấn
-    smsEnabled = false;       // lưu state = OFF
+  // ====== BUTTON OFF: NHẤN 1 CÁI -> TẮT smsEnabled ======
+  if (readingOff == LOW && lastBtnOff == HIGH) {
+    smsEnabled = false;
     Serial.println("[BTN] OFF pressed -> smsEnabled = FALSE");
   }
   lastBtnOff = readingOff;
-
-// ====== BUTTON OFF ======
-if (readingOff != lastBtnOff) {
-  lastDebOff = millis();
-}
-if ((millis() - lastDebOff) > debounceDelay) {
-  if (readingOff == LOW && lastBtnOff == HIGH) {
-    smsEnabled = false;
-    Serial.println("[BTN] OFF pressed ➜ smsEnabled = FALSE");
-  }
-}
-lastBtnOff = readingOff;
 
   // ====== CẢM BIẾN NƯỚC ======
   int water = analogRead(SENSOR_WATER);
@@ -470,15 +657,18 @@ lastBtnOff = readingOff;
   if (alarmOn) {
     if (haveMAX) sampleMaxAndUpdateHR();
 
-    if (millis() - lastGpsPrint >= 2000) {
-      printGPS();
-      lastGpsPrint = millis();
-    }
-
-    if (millis() - lastTsSend >= 20000) {
+    // Lên lịch gửi ThingSpeak mỗi TS_INTERVAL_MS
+    if (millis() - lastTsSend >= TS_INTERVAL_MS) {
       lastTsSend = millis();
       if (haveMAX) computeSpO2();
-      sendToThingSpeak();
+
+      if (latestFix) {
+        tsLat = latestLat;
+        tsLon = latestLon;
+        tsReqPending = true;     // để taskSIM gửi
+      } else {
+        Serial.println("[TS] Skip (no GPS fix)");
+      }
     }
 
     if (millis() - lastSensorPrint >= 1000) {
@@ -510,16 +700,16 @@ lastBtnOff = readingOff;
       Serial.println(smsEnabled ? "ON" : "OFF");
     }
 
-    // ====== GỬI SMS ======
+    // ====== LÊN LỊCH GỬI SMS ======
     if (smsEnabled && (millis() - lastSmsTime >= SMS_INTERVAL_MS)) {
       Serial.println("[SMS] Check GPS...");
-      if (gps.location.isValid()) {
-        float lat = gps.location.lat();
-        float lon = gps.location.lng();
-        Serial.println("[SMS] GPS FIX OK -> Gui SMS...");
-        sendLocationSMS(lat, lon);
+      if (latestFix) {
+        smsLat = latestLat;
+        smsLon = latestLon;
+        smsReqPending = true;    // để taskSIM gửi
+        Serial.println("[SMS] GPS FIX OK -> Queue SMS...");
       } else {
-        Serial.println("[SMS] GPS CHUA FIX -> KHONG gui SMS.");
+        Serial.println("[SMS] GPS CHUA FIX -> KHONG queue SMS.");
       }
       lastSmsTime = millis();
     }
